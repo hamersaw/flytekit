@@ -6,6 +6,7 @@ import enum
 import inspect
 import json as _json
 import mimetypes
+import pickle
 import typing
 from abc import ABC, abstractmethod
 from typing import Optional, Type, cast
@@ -26,6 +27,7 @@ from flytekit.loggers import logger
 from flytekit.models import interface as _interface_models
 from flytekit.models import types as _type_models
 from flytekit.models.core import types as _core_types
+from flytekit.models.interface import Variable
 from flytekit.models.literals import Literal, LiteralCollection, LiteralMap, Primitive, Scalar
 from flytekit.models.types import LiteralType, SimpleType
 
@@ -407,7 +409,11 @@ class TypeEngine(typing.Generic[T]):
 
     @classmethod
     def literal_map_to_kwargs(
-        cls, ctx: FlyteContext, lm: LiteralMap, python_types: typing.Dict[str, type]
+        cls,
+        ctx: FlyteContext,
+        lm: LiteralMap,
+        python_types: typing.Dict[str, type],
+        literal_type: typing.Dict[str, Variable] = None,
     ) -> typing.Dict[str, typing.Any]:
         """
         Given a ``LiteralMap`` (usually an input into a task - intermediate), convert to kwargs for the task
@@ -416,8 +422,54 @@ class TypeEngine(typing.Generic[T]):
             raise ValueError(
                 f"Received more input values {len(lm.literals)}" f" than allowed by the input spec {len(python_types)}"
             )
-
-        return {k: TypeEngine.to_python_value(ctx, lm.literals[k], v) for k, v in python_types.items()}
+        python_value_map = {}
+        for k, v in python_types.items():
+            # We don't need to use TypeEngine to translate literal to python value if input type is PYTHON_PICKLE_FORMAT
+            # Just use the data in the pickle file
+            if (
+                lm.literals[k].scalar
+                and lm.literals[k].scalar.blob
+                and lm.literals[k].scalar.blob.metadata.type.format == "python-pickle"
+            ):
+                uri = ""
+                # Download pickle file to local first if file is not in the local file systems.
+                if ctx.file_access.is_remote(lm.literals[k].scalar.blob.uri):
+                    ctx.file_access.get_data(lm.literals[k].scalar.blob.uri, "./pickle-file", False)
+                    uri = "./pickle-file"
+                else:
+                    uri = lm.literals[k].scalar.blob.uri
+                infile = open(uri, "rb")
+                v = pickle.load(infile)
+                infile.close()
+                python_value_map[k] = v
+            # Handle special case here.
+            # We can't use the transformer to convert Literal to python value since we can't know literal's python type
+            # Task A output type is str, but Task B expect input type is Any which will fall back to PythonPickle
+            # In this scenario, We directly extract value from scalar, collection, or map.
+            # e.g.
+            # @task
+            # def A(name: str) -> str:
+            #     return f"Welcome, {name}!"
+            #
+            # @task
+            # def B(greeting: typing.Any) -> str:
+            #     return f"{greeting} How are you?"
+            #
+            # @workflow
+            # def welcome(name: str) -> str:
+            #     greeting = A(name=name)
+            #     return B(greeting=greeting)
+            #
+            elif literal_type[k].type.blob and literal_type[k].type.blob.format == "python-pickle":
+                if lm.literals[k].scalar:
+                    python_value_map[k] = lm.literals[k].scalar.primitive.value
+                elif lm.literals[k].collection:
+                    python_value_map[k] = [l.scalar.primitive.value for l in lm.literals[k].collection.literals]
+                elif lm.literals[k].map:
+                    python_value_map[k] = {x: y for x, y in lm.literals[k].map.literals.items()}
+            else:
+                python_value_map[k] = TypeEngine.to_python_value(ctx, lm.literals[k], v)
+        return python_value_map
 
     @classmethod
     def dict_to_literal_map(
